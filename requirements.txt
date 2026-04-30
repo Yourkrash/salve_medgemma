@@ -1,0 +1,7 @@
+torch>=2.1
+transformers>=4.45
+datasets
+pillow
+numpy
+tqdm
+matplotlib
