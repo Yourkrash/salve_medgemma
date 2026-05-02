@@ -5,11 +5,14 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoModelForImageTextToText, AutoImageProcessor  # <-- используем AutoImageProcessor
+from peft import PeftModel
 from sae_model import SparseAutoencoder
 
 # ---------- Конфигурация ----------
-MODEL_ID = "medgemma-4b-it-sft-lora-crc100k"
+HF_TOKEN = ""
+MODEL_ID = "google/medgemma-4b-it"
+ADAPTER_PATH = "./medgemma-4b-it-sft-lora-crc100k"
 FEATURES_PATH = "./features/features.npy"
 LABELS_PATH = "./features/labels.npy"
 CLASS_NAMES_PATH = "./features/class_names.npy"
@@ -20,15 +23,19 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 1. Загружаем модель Med‑Gemma и процессор
-model = AutoModelForImageTextToText.from_pretrained(
+base_model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
-    attn_implementation="eager",
+    low_cpu_mem_usage=True,
+    token=HF_TOKEN
 )
-processor = AutoProcessor.from_pretrained(MODEL_ID)
+model = PeftModel.from_pretrained(base_model, ADAPTER_PATH, token=HF_TOKEN, ensure_weight_tying=True)
 model.eval()
-vision_encoder = model.vision_model
+processor = AutoImageProcessor.from_pretrained(MODEL_ID, token=HF_TOKEN, use_fast=False )
+
+# Получаем vision tower
+vision_encoder = model.base_model.model.model.vision_tower
 
 # 2. Загружаем обученный SAE
 features_np = np.load(FEATURES_PATH)
@@ -85,7 +92,7 @@ def grad_fam(image: Image.Image, target_latent_idx: int):
 
     # Нам нужно получить активации последнего слоя vision_encoder и градиенты по ним.
     # Выберем слой, с которого будем брать feature maps – последний блок энкодера.
-    target_layer = vision_encoder.encoder.layers[-1]  # SiglipEncoderLayer
+    target_layer = vision_encoder.vision_model.encoder.layers[-1]  # SiglipEncoderLayer
 
     # Регистрируем хуки
     activations = None
@@ -131,7 +138,7 @@ def grad_fam(image: Image.Image, target_latent_idx: int):
         # Правильный путь: вызвать vision_encoder с входом, у которого requires_grad=True.
         # pixel_values из процессора – без градиентов. Присвоим requires_grad_().
         pixel_values_grad = pixel_values.detach().requires_grad_(True)
-        vision_out = vision_encoder(pixel_values_grad).last_hidden_state  # [1, N, D]
+        vision_out = vision_encoder(pixel_values_grad).last_hidden_state.float()  # [1, N, D]
 
         # Средний пул
         pooled = vision_out.mean(dim=1)  # [1, D]
@@ -184,17 +191,18 @@ def grad_fam(image: Image.Image, target_latent_idx: int):
 
 # Пример использования Grad‑FAM:
 # Загрузите одно изображение из вашего датасета
-# from datasets import load_dataset
-# data_val = load_dataset("./NCT-CRC-HE-100K", split="train").train_test_split(100)["test"]
-# sample_img = data_val[0]["image"].convert("RGB")
-# # Выберите латент, доминирующий для класса 8 (I: colorectal...)
-# dominant_latent = np.argmax(np.abs(class_means[8]))  # предположим, класс 8
-# hm = grad_fam(sample_img, dominant_latent)
-# plt.imshow(sample_img.resize((384,384)), alpha=0.7)
-# plt.imshow(hm, cmap='jet', alpha=0.3)
-# plt.axis('off')
-# plt.savefig(f"{OUTPUT_DIR}/gradfam_latent{dominant_latent}.png")
-# plt.close()
+from datasets import load_dataset
+data_val = load_dataset("./NCT-CRC-HE-100K", split="train").train_test_split(100)["test"]
+sample_img = data_val[3]["image"].convert("RGB")
+sample_img.save(f"{OUTPUT_DIR}/image.png")
+# Выберите латент, доминирующий для класса 8 (I: colorectal...)
+dominant_latent = np.argmax(np.abs(class_means[1]))  # предположим, класс 8
+hm = grad_fam(sample_img, dominant_latent)
+plt.imshow(sample_img.resize((384,384)), alpha=0.7)
+plt.imshow(hm, cmap='jet', alpha=0.3)
+plt.axis('off')
+plt.savefig(f"{OUTPUT_DIR}/gradfam_latent{dominant_latent}.png")
+plt.close()
 
 print("Grad‑FAM функция готова. Для теста раскомментируйте код выше.")
 
@@ -224,7 +232,6 @@ def activation_maximisation(target_latent_idx: int, iterations=300, lr=0.05):
     # В Med‑Gemma процессор включает rescaling и нормализацию. Мы применим их внутри цикла.
 
     # Клонируем процессор, чтобы использовать только image_processor
-    img_processor = processor.image_processor
 
     for i in tqdm(range(iterations), desc="Activation Maximisation"):
         optimizer.zero_grad()
@@ -242,13 +249,13 @@ def activation_maximisation(target_latent_idx: int, iterations=300, lr=0.05):
         # inputs = img_processor(images=param_img, return_tensors="pt") – не сработает, т.к. param_img с градиентами.
         # Сделаем обходной путь: извлечём нормализацию и применим вручную.
         # Достанем mean и std из img_processor.image_mean и image_std:
-        mean = torch.tensor(img_processor.image_mean, device=device).view(1, 3, 1, 1)
-        std = torch.tensor(img_processor.image_std, device=device).view(1, 3, 1, 1)
+        mean = torch.tensor(processor.image_mean, device=device).view(1, 3, 1, 1)
+        std = torch.tensor(processor.image_std, device=device).view(1, 3, 1, 1)
         # Нормализуем
         normalized_img = (param_img - mean) / std
 
         # Прогоняем через vision_encoder
-        vision_out = vision_encoder(normalized_img).last_hidden_state  # [1, N, D]
+        vision_out = vision_encoder(normalized_img, interpolate_pos_encoding=True).last_hidden_state.float()  # [1, N, D]
 
         # Глобальный пул
         pooled = vision_out.mean(dim=1)
@@ -280,7 +287,7 @@ def activation_maximisation(target_latent_idx: int, iterations=300, lr=0.05):
     return viz_pil
 
 # Пример генерации для доминантного латента класса I
-# idx = np.argmax(np.abs(class_means[8]))
+# idx = np.argmax(np.abs(class_means[0]))
 # generated = activation_maximisation(idx, iterations=500)
 # generated.save(f"{OUTPUT_DIR}/actmax_latent{idx}.png")
 
